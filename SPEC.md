@@ -147,13 +147,13 @@ Pod Lifecycle Timeline
   vault.hashicorp.com/auth-path: "auth/kubernetes"
   vault.hashicorp.com/agent-inject-status: "update"
   
-  # 1. Properties with Actuator refresh command hook
+  # 1. Properties with Dynamic Key-Value Loop & Actuator refresh hook
   vault.hashicorp.com/agent-inject-secret-application-vault.properties: "secret/data/myapp/config"
   vault.hashicorp.com/agent-inject-template-application-vault.properties: |
     {{- with secret "secret/data/myapp/config" -}}
-    app.api-key={{ .Data.data.api_key }}
-    spring.datasource.username={{ .Data.data.username }}
-    spring.datasource.password={{ .Data.data.password }}
+    {{- range $key, $value := .Data.data }}
+    {{ $key }}={{ $value }}
+    {{- end }}
     {{- end }}
   vault.hashicorp.com/agent-inject-command-application-vault.properties: |
     curl -s -X POST http://localhost:8080/actuator/refresh || true
@@ -171,7 +171,16 @@ Pod Lifecycle Timeline
     {{- end }}
   ```
 
-- **Pros**: Zero core business code changes; secrets written to `/vault/secrets/` in-memory `emptyDir` mount; supports hot-reloading for both properties and SSL certificates.
+#### Creating Secrets in Vault (Dot-Notation for Spring Boot):
+```bash
+vault kv put secret/myapp/config \
+  spring.datasource.url="jdbc:postgresql://db.svc:5432/appdb" \
+  spring.datasource.username="app_user" \
+  spring.datasource.password="P@ssw0rd123!" \
+  app.payment.api-key="sk_live_998877"
+```
+
+- **Pros**: Zero core business code changes; secrets written to `/vault/secrets/` in-memory `emptyDir` mount; dynamically renders any key-value pairs without manual template edits; supports hot-reloading for both properties and SSL certificates.
 - **Cons**: Requires Vault Agent Injector mutating webhook; requires pod restart strategy for non-reloadable infrastructure resources like database connection pools (`HikariCP`).
 - **Full OpenShift & Spring Boot Specification**: See [`OPENSHIFT_SPRINGBOOT_SPEC.md`](OPENSHIFT_SPRINGBOOT_SPEC.md).
 

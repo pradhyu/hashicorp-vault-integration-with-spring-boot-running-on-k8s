@@ -164,14 +164,13 @@ spec:
         vault.hashicorp.com/agent-inject-status: "update"
         vault.hashicorp.com/auth-path: "auth/kubernetes"
         
-        # 2. Render Application Properties & Trigger Actuator Refresh
+        # 2. Render Application Properties (Dynamic Key-Value Loop) & Trigger Actuator Refresh
         vault.hashicorp.com/agent-inject-secret-application-vault.properties: "secret/data/my-app/config"
         vault.hashicorp.com/agent-inject-template-application-vault.properties: |
           {{- with secret "secret/data/my-app/config" -}}
-          app.payment.api-key={{ .Data.data.api_key }}
-          app.features.enable-discounts={{ .Data.data.enable_discounts }}
-          spring.datasource.username={{ .Data.data.db_user }}
-          spring.datasource.password={{ .Data.data.db_pass }}
+          {{- range $key, $value := .Data.data }}
+          {{ $key }}={{ $value }}
+          {{- end }}
           {{- end -}}
         vault.hashicorp.com/agent-inject-command-application-vault.properties: |
           curl -s -X POST http://localhost:8080/actuator/refresh || true
@@ -218,30 +217,55 @@ spec:
 
 ---
 
-### 2.5 Spring Boot Application Setup (Java Code & `application.yml`)
+### 2.5 Spring Boot 4 Application Setup (Java Code & `application.yml`)
 
-#### `pom.xml` Dependencies:
+Spring Boot 4 baselines on **Java 21+**, **Jakarta EE 11+**, and **Virtual Threads**.
+
+#### `pom.xml` (Spring Boot 4 & Java 21+):
 ```xml
-<dependencies>
-    <!-- Web & Actuator -->
-    <dependency>
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    
+    <parent>
         <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-web</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-actuator</artifactId>
-    </dependency>
-    <!-- Spring Cloud Context for @RefreshScope -->
-    <dependency>
-        <groupId>org.springframework.cloud</groupId>
-        <artifactId>spring-cloud-starter-bootstrap</artifactId>
-        <version>4.1.2</version>
-    </dependency>
-</dependencies>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.0.0</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>spring-boot-vault-app</artifactId>
+    <version>1.0.0</version>
+
+    <properties>
+        <java.version>21</java.version>
+        <spring-cloud.version>2025.0.0</spring-cloud.version>
+    </properties>
+
+    <dependencies>
+        <!-- Web & Actuator -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <!-- Spring Cloud Context for @RefreshScope Hot-Reloading -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-bootstrap</artifactId>
+            <version>4.2.0</version>
+        </dependency>
+    </dependencies>
+</project>
 ```
 
-#### `src/main/resources/application.yml`:
+#### `src/main/resources/application.yml` (Spring Boot 4):
 ```yaml
 server:
   port: 8443
@@ -249,11 +273,14 @@ server:
     bundle: "vault-ssl-bundle"
 
 spring:
+  threads:
+    virtual:
+      enabled: true               # Spring Boot 4 Virtual Threads (Project Loom)
   ssl:
     bundle:
       pem:
         vault-ssl-bundle:
-          reload-on-update: true    # Automatically hot-reloads SSL context when sidecar updates cert!
+          reload-on-update: true   # Dynamic SSL Context hot-reload when sidecar rotates certs!
           keystore:
             certificate: "file:/vault/secrets/tls.crt"
             private-key: "file:/vault/secrets/tls.key"
@@ -293,6 +320,230 @@ public class PaymentController {
     }
 }
 ```
+
+---
+
+### 2.6 Consul Template Patterns: Dynamic Key-Value Loops, JSON & YAML
+
+Instead of hardcoding each secret key in the OpenShift manifest, Consul Template allows dynamic iteration and multi-format serialization:
+
+#### 1. Dynamic Key-Value Iteration (`.properties`)
+Automatically extracts all keys and values from Vault without listing individual key names:
+```yaml
+vault.hashicorp.com/agent-inject-secret-application-vault.properties: "secret/data/my-app/config"
+vault.hashicorp.com/agent-inject-template-application-vault.properties: |
+  {{- with secret "secret/data/my-app/config" -}}
+  {{- range $key, $value := .Data.data }}
+  {{ $key }}={{ $value }}
+  {{- end }}
+  {{- end -}}
+```
+
+#### 2. Native JSON Format (`.json`)
+Uses Consul Template's built-in `toJSONPretty` filter:
+```yaml
+vault.hashicorp.com/agent-inject-secret-application-vault.json: "secret/data/my-app/config"
+vault.hashicorp.com/agent-inject-template-application-vault.json: |
+  {{- with secret "secret/data/my-app/config" -}}
+  {{ .Data.data | toJSONPretty }}
+  {{- end -}}
+```
+*Spring Boot Location:* `SPRING_CONFIG_ADDITIONAL_LOCATION=file:/vault/secrets/application-vault.json`
+
+#### 3. Native YAML Format (`.yml`)
+Uses Consul Template's built-in `toYAML` filter:
+```yaml
+vault.hashicorp.com/agent-inject-secret-application-vault.yml: "secret/data/my-app/config"
+vault.hashicorp.com/agent-inject-template-application-vault.yml: |
+  {{- with secret "secret/data/my-app/config" -}}
+  {{ .Data.data | toYAML }}
+  {{- end -}}
+```
+*Spring Boot Location:* `SPRING_CONFIG_ADDITIONAL_LOCATION=file:/vault/secrets/application-vault.yml`
+
+---
+
+### 2.7 Where and How to Create the Secret in Vault for Spring Boot Properties
+
+To ensure the rendered properties work seamlessly with Spring Boot 4's property binding (`@Value`, `@ConfigurationProperties`, and auto-configured `DataSource`), **name the keys in Vault using standard Spring Boot dot-notation**.
+
+```text
++-------------------------------------------------------------------------------------------------+
+|                                END-TO-END SECRET TRANSFORMATION FLOW                            |
++-------------------------------------------------------------------------------------------------+
+| 1. RAW SECRET IN VAULT (`secret/data/my-app/config`):                                           |
+|    "spring.datasource.username" : "app_user"                                                    |
+|    "spring.datasource.password" : "P@ssw0rd123!"                                                |
+|    "app.payment.api-key"        : "sk_live_9988776655"                                          |
+|    "app.features.enable-discounts" : "true"                                                     |
++-------------------------------------------------------------------------------------------------+
+                                               |
+                                               | Read by `vault-agent` Sidecar
+                                               v
++-------------------------------------------------------------------------------------------------+
+| 2. CONSUL TEMPLATE EVALUATION IN OPENSHIFT POD:                                                 |
+|    {{- with secret "secret/data/my-app/config" -}}                                              |
+|    {{- range $key, $value := .Data.data }}                                                      |
+|    {{ $key }}={{ $value }}                                                                      |
+|    {{- end }}                                                                                   |
+|    {{- end -}}                                                                                  |
++-------------------------------------------------------------------------------------------------+
+                                               |
+                                               | Renders file on `emptyDir` mount
+                                               v
++-------------------------------------------------------------------------------------------------+
+| 3. RENDERED FILE (`/vault/secrets/application-vault.properties`):                               |
+|    app.features.enable-discounts=true                                                           |
+|    app.payment.api-key=sk_live_9988776655                                                      |
+|    spring.datasource.password=P@ssw0rd123!                                                      |
+|    spring.datasource.username=app_user                                                          |
++-------------------------------------------------------------------------------------------------+
+                                               |
+                                               | Consumed via SPRING_CONFIG_ADDITIONAL_LOCATION
+                                               v
++-------------------------------------------------------------------------------------------------+
+| 4. SPRING BOOT 4 APPLICATION CONTEXT (JVM MEMORY):                                              |
+|    - HikariDataSource -> connects with "app_user" / "P@ssw0rd123!"                              |
+|    - @Value("${app.payment.api-key}") -> receives "sk_live_9988776655"                          |
+|    - @Value("${app.features.enable-discounts}") -> receives true                                |
++-------------------------------------------------------------------------------------------------+
+```
+
+#### 1. Vault Secret Key-Value Schema
+
+| Key in Vault (Dot Notation) | Example Value | Target Spring Boot Usage |
+| :--- | :--- | :--- |
+| `spring.datasource.url` | `jdbc:postgresql://postgres.my-app-namespace.svc:5432/appdb` | Auto-configured `HikariDataSource` URL |
+| `spring.datasource.username` | `app_user` | Auto-configured DB Username |
+| `spring.datasource.password` | `P@ssw0rd123!` | Auto-configured DB Password |
+| `app.payment.api-key` | `sk_live_9988776655` | Injected into `@Value("${app.payment.api-key}")` |
+| `app.features.enable-discounts` | `true` | Injected into `@Value("${app.features.enable-discounts}")` |
+| `app.security.jwt-secret` | `4a8f9c1b7e2d0...` | Injected into JWT Token Validator Bean |
+
+---
+
+#### 2. Creating via Vault CLI
+
+Run the following command in your terminal (or OpenShift Vault CLI pod):
+
+```bash
+# Set Vault Address and Token
+export VAULT_ADDR="https://vault.vault-system.svc.cluster.local:8200"
+export VAULT_TOKEN="<your-vault-token>"
+
+# Create or Update the KV v2 secret with standard Spring Boot property keys
+vault kv put secret/my-app/config \
+  spring.datasource.url="jdbc:postgresql://postgres.my-app-namespace.svc:5432/appdb" \
+  spring.datasource.username="app_user" \
+  spring.datasource.password="P@ssw0rd123!" \
+  app.payment.api-key="sk_live_9988776655" \
+  app.features.enable-discounts="true" \
+  app.security.jwt-secret="4a8f9c1b7e2d0a3f5e8b9c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1"
+```
+
+To verify the secret was created properly:
+```bash
+vault kv get secret/my-app/config
+```
+
+---
+
+#### 3. Creating via Vault Web UI
+
+1. Open your Vault Web UI (e.g. `https://vault-ui.apps.my-openshift-cluster.com`).
+2. Navigate to **Secrets Engines** $\rightarrow$ click on `secret/` (KV v2).
+3. Click **Create secret**.
+4. Set **Path for this secret**: `my-app/config`.
+5. Enter the Key-Value pairs:
+   * **Key**: `spring.datasource.username` &nbsp;|&nbsp; **Value**: `app_user`
+   * **Key**: `spring.datasource.password` &nbsp;|&nbsp; **Value**: `P@ssw0rd123!`
+   * **Key**: `app.payment.api-key` &nbsp;|&nbsp; **Value**: `sk_live_9988776655`
+   * **Key**: `app.features.enable-discounts` &nbsp;|&nbsp; **Value**: `true`
+6. Click **Save**.
+
+---
+
+#### 4. Creating via Vault HTTP REST API (`curl`)
+
+If managing secrets programmatically via CI/CD pipelines or scripts without installing the Vault CLI:
+
+```bash
+# Write / Create Secret via HTTP API (KV v2)
+curl --silent --location --request POST "https://vault.vault-system.svc.cluster.local:8200/v1/secret/data/my-app/config" \
+  --header "X-Vault-Token: ${VAULT_TOKEN}" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "data": {
+      "spring.datasource.url": "jdbc:postgresql://postgres.my-app-namespace.svc:5432/appdb",
+      "spring.datasource.username": "app_user",
+      "spring.datasource.password": "P@ssw0rd123!",
+      "app.payment.api-key": "sk_live_9988776655",
+      "app.features.enable-discounts": "true",
+      "app.security.jwt-secret": "4a8f9c1b7e2d0a3f5e8b9c1d2e3f4a5b"
+    }
+  }'
+```
+
+To read and verify the secret via REST API:
+```bash
+curl --silent --header "X-Vault-Token: ${VAULT_TOKEN}" \
+  "https://vault.vault-system.svc.cluster.local:8200/v1/secret/data/my-app/config" | jq .data.data
+```
+
+---
+
+#### 5. Patching / Updating an Existing Key (CLI & REST API)
+
+When you only need to rotate a single password or API key without overwriting all other properties:
+
+**Via Vault CLI:**
+```bash
+# Update just the database password and API key
+vault kv patch secret/my-app/config \
+  spring.datasource.password="NewSuperSecretPass456!" \
+  app.payment.api-key="sk_live_new_key_112233"
+```
+
+**Via HTTP REST API:**
+```bash
+# Patch specific keys via HTTP PATCH
+curl --silent --location --request PATCH "https://vault.vault-system.svc.cluster.local:8200/v1/secret/data/my-app/config" \
+  --header "X-Vault-Token: ${VAULT_TOKEN}" \
+  --header "Content-Type: application/merge-patch+json" \
+  --data '{
+    "data": {
+      "spring.datasource.password": "NewSuperSecretPass456!",
+      "app.payment.api-key": "sk_live_new_key_112233"
+    }
+  }'
+```
+
+---
+
+#### 5. How Spring Boot Automatically Consumes the Rendered Properties
+
+When Vault Agent executes the dynamic template:
+```yaml
+{{- with secret "secret/data/my-app/config" -}}
+{{- range $key, $value := .Data.data }}
+{{ $key }}={{ $value }}
+{{- end }}
+{{- end -}}
+```
+
+It renders `/vault/secrets/application-vault.properties`:
+```properties
+app.features.enable-discounts=true
+app.payment.api-key=sk_live_9988776655
+app.security.jwt-secret=4a8f9c1b7e2d0a3f5e8b9c1d2e3f4a5b
+spring.datasource.password=P@ssw0rd123!
+spring.datasource.url=jdbc:postgresql://postgres.my-app-namespace.svc:5432/appdb
+spring.datasource.username=app_user
+```
+
+Because `SPRING_CONFIG_ADDITIONAL_LOCATION=file:/vault/secrets/application-vault.properties` is set on the container:
+1. Spring Boot's auto-configuration binds `spring.datasource.*` directly into HikariCP to establish database connections.
+2. `@Value("${app.payment.api-key}")` and `@RefreshScope` controllers immediately receive their injected strings.
 
 ---
 
@@ -438,12 +689,12 @@ The Spring Boot application communicates directly with the Vault REST API using 
          +------------------------------+
 ```
 
-### 4.2 Spring Boot Maven Dependencies (`pom.xml`)
+### 4.2 Spring Boot 4 Maven Dependencies (`pom.xml`)
 
 ```xml
 <properties>
-    <java.version>17</java.version>
-    <spring-cloud.version>2023.0.3</spring-cloud.version>
+    <java.version>21</java.version>
+    <spring-cloud.version>2025.0.0</spring-cloud.version>
 </properties>
 
 <dependencyManagement>
@@ -459,13 +710,13 @@ The Spring Boot application communicates directly with the Vault REST API using 
 </dependencyManagement>
 
 <dependencies>
-    <!-- Spring Cloud Starter Vault -->
+    <!-- Spring Cloud Starter Vault Config -->
     <dependency>
         <groupId>org.springframework.cloud</groupId>
         <artifactId>spring-cloud-starter-vault-config</artifactId>
     </dependency>
 
-    <!-- Spring Boot Actuator for Refresh Endpoints -->
+    <!-- Spring Boot 4 Actuator for Refresh Endpoints -->
     <dependency>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-actuator</artifactId>
