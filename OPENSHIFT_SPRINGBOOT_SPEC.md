@@ -611,66 +611,68 @@ management:
 
 #### Spring Boot Property Override Parameters: `spring.config.import` vs. `spring.config.additional-location`
 
-To understand the difference, look at **HOW** Spring Boot finds and loads configuration files during startup:
+When overriding configuration properties from Vault (e.g. `.properties` or `.yml` files), understand how Spring Boot 4 interprets both mechanisms:
 
 ```text
 ========================================================================================================
-1. TRADITIONAL SEARCH PATH (spring.config.additional-location): "SEARCH IN EXTRA DIRECTORIES"
+1. `spring.config.additional-location`: "EXTENSION OF THE SEARCH PATH"
 ========================================================================================================
-Spring Boot by default looks for application.properties/yml in fixed directories:
-  [classpath:/, classpath:/config/, file:./, file:./config/]
-
-When you set:
-  SPRING_CONFIG_ADDITIONAL_LOCATION=file:/vault/secrets/
-
-Spring Boot treats /vault/secrets/ as an ADDITIONAL FOLDER to search for:
-  - It expects to find standard files named `application.properties` or `application-{profile}.properties` inside that folder.
-  - It searches this folder BEFORE or AFTER the standard locations based on internal precedence.
-  - It is an all-or-nothing folder lookup from the Boot 1.x/2.x era.
+Mental Model: "Add this location to Spring's search routine."
+  - Acts as a search path extension (whether pointing to a directory or a specific file).
+  - Profile Resolution Side-Effect: If profile 'prod' is active and you point to a file
+    `file:/vault/secrets/vault-config.properties`, Spring Boot will still treat it as a search
+    base and attempt to scan for `file:/vault/secrets/vault-config-prod.properties` as well.
+  - Legacy Engine: Carried forward from Spring Boot 1.x/2.x for backward compatibility.
 
 ========================================================================================================
-2. MODERN ConfigData API (spring.config.import): "DIRECTLY INCLUDE THIS SPECIFIC RESOURCE"
+2. `spring.config.import`: "EXPLICIT DISCRETE RESOURCE IMPORT"
 ========================================================================================================
-When you set:
-  spring.config.import=optional:file:/vault/secrets/application-vault.properties
-
-Spring Boot does NOT just search a folder. It directly imports that EXACT resource as part of the config stream:
-  - You can point to ANY arbitrary filename (e.g., `application-vault.properties`, `db-creds.ini`, etc.).
-  - It allows the `optional:` flag so startup never fails if the file is missing (crucial for local dev and CI tests).
-  - It allows protocol prefixes: `file:`, `classpath:`, `configtree:`, `vault://`, `consul://`, `aws-secretsmanager:`.
-  - Properties loaded via `spring.config.import` immediately override the document that imported them.
+Mental Model: "Directly open and parse this exact resource right now."
+  - Treats the target as an isolated, discrete config source.
+  - Specific & Direct: You give it any exact filename (e.g. `file:/vault/secrets/application-vault.properties`),
+    and Spring loads strictly that file without guessing or attempting profile-suffix expansions.
+  - Modern ConfigData Engine: The standard configuration mechanism in Spring Boot 3 & 4.
+  - Protocol Flexibility: Works identically for `file:`, `configtree:`, and SDK URIs (`vault://`).
 ```
 
-#### Key Differences Breakdown:
+#### Comparison Matrix:
 
-| Dimension | `spring.config.additional-location` | `spring.config.import` |
+| Dimension | `spring.config.additional-location` (Search Path Extension) | `spring.config.import` (Discrete Resource Import) |
 | :--- | :--- | :--- |
-| **Mental Model** | *"Add this folder to the list of places you look for `application.properties`"* | *"Explicitly read this specific file/resource right now and merge its key-values"* |
-| **Target Naming** | Usually expects a directory path containing standard named files (`application.properties`). | Can import exact, arbitrarily named files (`application-vault.properties`, `custom.yaml`). |
-| **Missing File Behavior** | If the location does not exist, Spring Boot **aborts startup** with a fatal error. | With `optional:`, Spring Boot **silently ignores** missing files (safe for local development). |
-| **Supported Protocols** | Only local/container filesystem paths (`file:...`, `classpath:...`). | Anything supported by ConfigData loaders (`file:`, `configtree:`, `vault://`, `consul://`). |
-| **Where Declared** | Must be set from the outside (Environment Variable `SPRING_CONFIG_ADDITIONAL_LOCATION` or JVM `-D` arg). | Can be declared cleanly inside `src/main/resources/application.yml` OR via environment variable (`SPRING_CONFIG_IMPORT`). |
+| **Core Concept** | **Search Path Extension**: Extends the list of locations where Spring searches for config files. | **Discrete File Import**: Explicitly imports a specific, targeted config file directly into the environment. |
+| **Profile Resolution** | **Active Search**: Even if given a specific file, Spring treats it as a search root and scans for profile variants (e.g. `*-prod.properties`). | **Exact Load**: Loads strictly the specified file. No profile-suffix guessing or unintended file scanning. |
+| **Target Flexibility** | Primarily designed for directory search paths or standard naming. | Can point directly to any arbitrary filename (`application-vault.properties`, `db.properties`, etc.). |
+| **Architecture** | Legacy search path loader (Boot 1.x / 2.x era). | Modern ConfigData API (Standard for Boot 3 & 4). |
 
-#### Concrete Example:
+#### How to pass via Helm Chart / Environment Variables / JVM `-D`
 
-1. **Using `spring.config.import` (Recommended):**
-   ```yaml
-   # src/main/resources/application.yml
-   spring:
-     config:
-       import:
-         # Safely ignored on developer laptop / CI pipeline, loaded in OpenShift container:
-         - "optional:file:/vault/secrets/application-vault.properties"
-   ```
+You can pass either property dynamically from Helm without hardcoding anything in your source repository:
 
-2. **Using `SPRING_CONFIG_ADDITIONAL_LOCATION` (Legacy approach):**
-   ```yaml
-   # OpenShift Deployment env:
-   env:
-     - name: SPRING_CONFIG_ADDITIONAL_LOCATION
-       value: "file:/vault/secrets/"
-   # (Vault Agent template must write a file named strictly "application.properties")
-   ```
+##### Option A: OpenShift Container Environment Variable (Recommended)
+Spring Boot's relaxed property binding translates `SPRING_CONFIG_IMPORT` directly:
+
+```yaml
+# Helm Deployment Template (templates/deployment.yaml)
+spec:
+  containers:
+    - name: spring-boot-app
+      image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+      env:
+        # Passes exact file directly into Spring Boot 4 ConfigData engine:
+        - name: SPRING_CONFIG_IMPORT
+          value: "file:/vault/secrets/application-vault.properties"
+```
+
+##### Option B: Passing via JVM System Property (`-D` argument)
+```yaml
+# Helm Deployment Template
+spec:
+  containers:
+    - name: spring-boot-app
+      env:
+        - name: JAVA_TOOL_OPTIONS
+          value: "-Dspring.config.import=file:/vault/secrets/application-vault.properties"
+```
 
 ---
 
