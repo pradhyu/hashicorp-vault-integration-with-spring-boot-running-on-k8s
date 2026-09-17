@@ -648,8 +648,24 @@ Mental Model: "Directly open and parse this exact resource right now."
 
 You can pass either property dynamically from Helm without hardcoding anything in your source repository:
 
-##### Option A: OpenShift Container Environment Variable (Recommended)
-Spring Boot's relaxed property binding translates `SPRING_CONFIG_IMPORT` directly:
+#### Passing Multiple Files with `spring.config.import`
+
+Yes! `spring.config.import` fully supports importing multiple discrete files. 
+
+**Order of Evaluation:** Files are loaded from **left to right** (or top to bottom). If the same key exists in multiple files, the **last file loaded takes highest precedence and wins**.
+
+##### 1. Via `application.yml` (List Syntax):
+```yaml
+spring:
+  config:
+    import:
+      - "file:/vault/secrets/application-vault.properties"
+      - "file:/vault/secrets/database-vault.properties"
+      - "file:/vault/secrets/kafka-vault.properties"
+```
+
+##### 2. Via OpenShift Container Environment Variable in Helm (Comma-Separated):
+Spring Boot parses comma-separated strings into a list:
 
 ```yaml
 # Helm Deployment Template (templates/deployment.yaml)
@@ -658,12 +674,27 @@ spec:
     - name: spring-boot-app
       image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
       env:
-        # Passes exact file directly into Spring Boot 4 ConfigData engine:
         - name: SPRING_CONFIG_IMPORT
-          value: "file:/vault/secrets/application-vault.properties"
+          value: "file:/vault/secrets/app.properties,file:/vault/secrets/db.properties,file:/vault/secrets/kafka.properties"
 ```
 
-##### Option B: Passing via JVM System Property (`-D` argument)
+Or dynamically template it from Helm `values.yaml`:
+```yaml
+# values.yaml
+vaultSecretFiles:
+  - "file:/vault/secrets/app.properties"
+  - "file:/vault/secrets/db.properties"
+
+# templates/deployment.yaml
+spec:
+  containers:
+    - name: spring-boot-app
+      env:
+        - name: SPRING_CONFIG_IMPORT
+          value: "{{ join "," .Values.vaultSecretFiles }}"
+```
+
+##### 3. Via JVM System Property (`-D` argument) / `JAVA_TOOL_OPTIONS`:
 ```yaml
 # Helm Deployment Template
 spec:
@@ -671,7 +702,7 @@ spec:
     - name: spring-boot-app
       env:
         - name: JAVA_TOOL_OPTIONS
-          value: "-Dspring.config.import=file:/vault/secrets/application-vault.properties"
+          value: "-Dspring.config.import=file:/vault/secrets/app.properties,file:/vault/secrets/db.properties"
 ```
 
 ---
