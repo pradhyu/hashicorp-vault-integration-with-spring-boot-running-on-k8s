@@ -106,21 +106,74 @@ sequenceDiagram
 
 ---
 
-### Pattern 2: Sidecar & Init Container (Kubernetes Vault Agent Injector)
-Vault Agent runs as an Init Container or Sidecar injected into application pods via annotations.
+### Pattern 2: Sidecar & Init Container (Kubernetes / OpenShift Vault Agent Injector)
+Vault Agent runs as an Init Container and Sidecar injected into application pods via OpenShift annotations.
+
+```
+Pod Lifecycle Timeline
+------------------------------------------------------------------------------------>
+[ 1. Pod Scheduled ] 
+        |
+        v
+[ 2. Init Container: vault-agent-init ]  --> Authenticates with Vault (ServiceAccount JWT)
+        |                                --> Fetches initial secrets & TLS certificates
+        |                                --> Renders files to shared emptyDir (/vault/secrets)
+        |                                --> Exits with code 0 (Terminates successfully)
+        v
+[ 3. Main Containers Start Simultaneously ]
+        |
+        +---> [ App Container: spring-boot-app ]  --> Reads /vault/secrets on JVM boot
+        |                                         --> Starts Tomcat/Netty & binds ports
+        |
+        +---> [ Sidecar: vault-agent ]            --> Runs continuously in background
+                                                  --> Renews Vault tokens before TTL expires
+                                                  --> Renews dynamic secret leases
+                                                  --> Re-renders files when secrets rotate
+                                                  --> Executes reload hooks (/actuator/refresh)
+```
+
+#### Detailed Container Responsibilities:
+- **`vault-agent-init` (`initContainer`)**: Runs once before app startup, reads OpenShift SA token at `/var/run/secrets/kubernetes.io/serviceaccount/token`, logs into Vault (`POST /v1/auth/kubernetes/login`), writes initial configuration and certificates to shared `emptyDir` at `/vault/secrets`, and terminates (`exit 0`). If Vault fails, it halts Pod startup immediately.
+- **`vault-agent` (`sidecar`)**: Runs forever alongside the application. Automatically renews the Vault token (`/v1/auth/token/renew-self`), maintains dynamic leases, detects secret rotations, re-renders files, and triggers reload hooks.
+
+#### Hot-Reloading Properties & Dynamic TLS (Spring Boot):
+1. **Application Properties Hot-Reload**: Vault Agent executes `vault.hashicorp.com/agent-inject-command: "curl -s -X POST http://localhost:8080/actuator/refresh"` to rebind Spring `@RefreshScope` beans without JVM restarts.
+2. **TLS / SSL Hot-Reload**: Spring Boot 3.2+ `SslBundle` with `reload-on-update: true` monitors `/vault/secrets/tls.crt` and `/vault/secrets/tls.key`, hot-swapping SSL contexts in Tomcat/Netty dynamically.
 
 - **Annotations Example**:
   ```yaml
   vault.hashicorp.com/agent-inject: "true"
   vault.hashicorp.com/role: "myapp-role"
-  vault.hashicorp.com/agent-inject-secret-config: "secret/data/myapp/database"
-  vault.hashicorp.com/agent-inject-template-config: |
-    {{- with secret "secret/data/myapp/database" -}}
-    DATABASE_URL=postgres://{{ .Data.data.username }}:{{ .Data.data.password }}@db:5432/main
+  vault.hashicorp.com/auth-path: "auth/kubernetes"
+  vault.hashicorp.com/agent-inject-status: "update"
+  
+  # 1. Properties with Actuator refresh command hook
+  vault.hashicorp.com/agent-inject-secret-application-vault.properties: "secret/data/myapp/config"
+  vault.hashicorp.com/agent-inject-template-application-vault.properties: |
+    {{- with secret "secret/data/myapp/config" -}}
+    app.api-key={{ .Data.data.api_key }}
+    spring.datasource.username={{ .Data.data.username }}
+    spring.datasource.password={{ .Data.data.password }}
+    {{- end }}
+  vault.hashicorp.com/agent-inject-command-application-vault.properties: |
+    curl -s -X POST http://localhost:8080/actuator/refresh || true
+
+  # 2. Dynamic TLS Certificate & Private Key
+  vault.hashicorp.com/agent-inject-secret-tls.crt: "pki/issue/myapp-role"
+  vault.hashicorp.com/agent-inject-template-tls.crt: |
+    {{- with secret "pki/issue/myapp-role" "common_name=myapp.svc" "ttl=24h" -}}
+    {{ .Data.certificate }}
+    {{- end }}
+  vault.hashicorp.com/agent-inject-secret-tls.key: "pki/issue/myapp-role"
+  vault.hashicorp.com/agent-inject-template-tls.key: |
+    {{- with secret "pki/issue/myapp-role" "common_name=myapp.svc" "ttl=24h" -}}
+    {{ .Data.private_key }}
     {{- end }}
   ```
-- **Pros**: Zero application code changes; secrets written to `/vault/secrets/` in-memory `tmpfs` mount.
-- **Cons**: Kubernetes-specific; requires template-based configuration.
+
+- **Pros**: Zero core business code changes; secrets written to `/vault/secrets/` in-memory `emptyDir` mount; supports hot-reloading for both properties and SSL certificates.
+- **Cons**: Requires Vault Agent Injector mutating webhook; requires pod restart strategy for non-reloadable infrastructure resources like database connection pools (`HikariCP`).
+- **Full OpenShift & Spring Boot Specification**: See [`OPENSHIFT_SPRINGBOOT_SPEC.md`](OPENSHIFT_SPRINGBOOT_SPEC.md).
 
 ---
 

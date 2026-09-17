@@ -1,6 +1,6 @@
 # 🚀 HashiCorp Vault & Spring Boot Integration on Red Hat OpenShift
 
-Comprehensive architecture, deployment manifests, application configurations, and operational trade-offs for three integration patterns between **HashiCorp Vault** and **Spring Boot** on **Red Hat OpenShift**.
+Comprehensive architecture, lifecycle mechanics, deployment manifests, application configurations, hot-reloading strategies, and TLS integration patterns between **HashiCorp Vault** and **Spring Boot** on **Red Hat OpenShift**.
 
 ---
 
@@ -23,11 +23,12 @@ Comprehensive architecture, deployment manifests, application configurations, an
 
 | Feature | Option 1: Vault Agent Sidecar | Option 2: Static Secret Sync (VSO/ESO) | Option 3: Direct Spring Cloud Vault |
 | :--- | :--- | :--- | :--- |
-| **Code Changes** | **None** | **None** | **Requires Dependencies & Config** |
+| **Code Changes** | **None** (Optional Actuator for hot-reload) | **None** | **Requires Dependencies & Config** |
 | **OpenShift Prerequisite** | Vault Agent Injector Webhook | Vault Secrets Operator (VSO) | Direct network route to Vault |
 | **Secret Storage Location** | In-memory `emptyDir` in Pod | OpenShift `etcd` (v1/Secret) | JVM Heap Memory only (Zero-Disk) |
 | **Dynamic Secrets / DB Leases** | Supported (Agent renews leases) | Limited / Best for Static KV | **Native & Full Dynamic Lifecycle** |
-| **Secret Rotation Handling** | File change / Pod restart | Pod restart or Config watcher | `@RefreshScope` / Actuator / Event |
+| **Properties Hot-Reload** | Via Sidecar hook + `@RefreshScope` | Pod restart or Config watcher | `@RefreshScope` / Actuator / Event |
+| **TLS Hot-Reload (SSL)** | Native via Spring 3.2+ `SslBundle` | Secret volume reload | Programmatic KeyStore reload |
 | **Local Dev Parity** | Requires Mock/Sidecar | Standard K8s/Env profile | Easy local test via profile/token |
 | **Security Context (SCC)** | Ephemeral volume mount | Standard OpenShift Secret mount | Standard Pod execution |
 
@@ -35,75 +36,115 @@ Comprehensive architecture, deployment manifests, application configurations, an
 
 ## 2. Option 1: Vault Agent Sidecar Injection
 
-### 2.1 Architectural Flow
+### 2.1 Pod Lifecycle: Init Container vs. Sidecar Container
 
-The Vault Agent Sidecar uses an OpenShift Mutating Admission Controller (Vault Agent Injector). When a Pod with specific annotations is scheduled, the webhook injects:
-1. An **`initContainer`** (`vault-agent-init`) that blocks app startup until secrets are initially fetched and rendered.
-2. A **`vault-agent`** sidecar container that manages ongoing token lifecycle, secret renewal, and templating.
+When Vault Agent injection is enabled via OpenShift annotations, the **Vault Mutating Webhook** injects two distinct containers into your Pod:
+
+```text
+Pod Lifecycle Timeline
+------------------------------------------------------------------------------------>
+[ 1. Pod Scheduled on OpenShift Node ] 
+        |
+        v
+[ 2. Init Container: vault-agent-init ]  --> Authenticates with Vault (ServiceAccount JWT)
+        |                                --> Fetches initial secrets & TLS certificates
+        |                                --> Renders files to shared emptyDir (/vault/secrets)
+        |                                --> Exits with code 0 (Terminates successfully)
+        v
+[ 3. Main Containers Start Simultaneously ]
+        |
+        +---> [ App Container: spring-boot-app ]  --> Reads /vault/secrets on JVM boot
+        |                                         --> Starts Tomcat/Netty & binds ports
+        |
+        +---> [ Sidecar: vault-agent ]            --> Runs continuously in background
+                                                  --> Renews Vault tokens before TTL expires
+                                                  --> Renews dynamic secret leases
+                                                  --> Re-renders files when secrets rotate
+                                                  --> Executes reload hooks (/actuator/refresh)
+```
+
+#### Detailed Container Responsibilities:
+
+| Container | Type | Lifecycle | Key Responsibilities |
+| :--- | :--- | :--- | :--- |
+| **`vault-agent-init`** | `initContainer` | Runs once before app startup, then terminates (`exit 0`). | 1. Reads OpenShift SA token at `/var/run/secrets/kubernetes.io/serviceaccount/token`.<br>2. Authenticates to Vault (`POST /v1/auth/kubernetes/login`).<br>3. Fetches initial properties & TLS certificates.<br>4. Renders files into shared `emptyDir`.<br>5. **Fails the Pod fast** if Vault is unreachable or permissions are invalid. |
+| **`vault-agent`** | `sidecar` | Runs continuously in parallel with Spring Boot container. | 1. **Token Lifecycle**: Automatically calls `/v1/auth/token/renew-self` before token expiry.<br>2. **Lease Management**: Keeps dynamic database/secret leases alive via `/v1/sys/leases/renew`.<br>3. **Secret Watching**: Polls Vault for KV changes or PKI renewals.<br>4. **Atomic Re-rendering**: Overwrites `/vault/secrets/*` files.<br>5. **Trigger Hooks**: Runs commands (e.g., `curl -X POST http://localhost:8080/actuator/refresh` or `pkill -SIGTERM java`). |
+
+---
+
+### 2.2 Application Properties Hot-Reloading Mechanics
+
+#### The Problem with Default Spring Boot
+Standard Spring Boot loads properties from `SPRING_CONFIG_ADDITIONAL_LOCATION` **only once during startup**. When the sidecar overwrites `/vault/secrets/application-vault.properties`, the disk changes but the JVM memory remains unchanged.
+
+#### The Solution: Sidecar Triggered `/actuator/refresh` + `@RefreshScope`
+
+```text
++-----------------------------------------------------------------------------------------+
+| OpenShift Pod                                                                           |
+|                                                                                         |
+| 1. Vault Agent detects secret change in Vault                                           |
+| 2. Vault Agent overwrites /vault/secrets/application-vault.properties                   |
+| 3. Vault Agent executes `command`: curl -X POST http://localhost:8080/actuator/refresh   |
+|                                        |                                                |
+|                                        v                                                |
+| 4. Spring Boot Actuator receives `/actuator/refresh`                                    |
+| 5. Spring re-reads `/vault/secrets/application-vault.properties` into `Environment`     |
+| 6. Spring re-instantiates all beans annotated with `@RefreshScope`                      |
+| 7. Next request receives NEW property values with ZERO downtime!                        |
++-----------------------------------------------------------------------------------------+
+```
+
+#### Reloadability Matrix: What Can vs Cannot be Hot-Reloaded
+
+| Property Category | Hot-Reloadable via `@RefreshScope`? | Behavior & Best Practice |
+| :--- | :---: | :--- |
+| **API Keys, Secrets, Feature Flags** |  **YES** | Instantly re-injected into `@RefreshScope` controllers/services. |
+| **Business Logic Configs & URLs** |  **YES** | Reloaded in-memory without dropping requests. |
+| **TLS / HTTPS Certificates** |  **YES** | Spring Boot 3.2+ `SslBundle` auto-reloads SSL Context natively. |
+| **Database Credentials (`HikariCP`)** | ⚠️ **Complex** | Hikari maintains open connection pools. Requires DataSource reset or Rolling Pod Restart. |
+| **JPA / Hibernate Metadata** | ❌ **NO** | Rebuilding SessionFactory causes memory leaks; requires Pod Restart. |
+| **Server Port (`server.port`)** | ❌ **NO** | Cannot re-bind active socket; requires Pod Restart. |
+
+> **Best Practice for Non-Reloadable Properties**: If rotating database credentials or infrastructure properties, configure Vault Agent to trigger a graceful pod shutdown (`vault.hashicorp.com/agent-inject-command: "pkill -SIGTERM java"`). OpenShift will perform a zero-downtime rolling update.
+
+---
+
+### 2.3 TLS / Certificate Integration (Spring Boot 3.2+ SSL Bundles)
+
+Vault's **PKI Secrets Engine** generates short-lived X.509 certificates. Vault Agent renders them as PEM files (`tls.crt`, `tls.key`, `ca.crt`) onto `/vault/secrets/`.
+
+Spring Boot 3.2+ natively supports **hot-reloading PEM certificates without restarting the JVM or dropping TCP connections**:
 
 ```text
 +------------------------------------------------------------------------------------+
-| OpenShift Worker Node - Pod (`spring-boot-vault-sidecar`)                          |
+| OpenShift Pod                                                                      |
 |                                                                                    |
+|  +------------------------+                     +-------------------------------+  |
+|  |  vault-agent (Sidecar) |                     |  Spring Boot 3.2+ (JVM)       |  |
+|  +-----------+------------+                     +---------------+---------------+  |
+|              |                                                  ^                  |
+|              | Renders PEM certificates                         | SslBundle        |
+|              v                                                  | File Watcher     |
+|  +--------------------------------------------------------------+---------------+  |
+|  | Shared Volume (/vault/secrets/)                                              |  |
+|  | ├── tls.crt          (Server X.509 Certificate)                              |  |
+|  | ├── tls.key          (RSA / ECDSA Private Key)                               |  |
+|  | ├── ca.crt           (Issuing CA Trust Chain)                                |  |
+|  | └── application-vault.properties                                             |  |
 |  +------------------------------------------------------------------------------+  |
-|  | Init Container: `vault-agent-init` (Fetches initial secrets before app boot) |  |
-|  +--------------------------------------+---------------------------------------+  |
-|                                         | Writes                                   |
-|                                         v                                          |
-|  +------------------------------------------------------------------------------+  |
-|  | Shared Ephemeral Volume: `emptyDir` (Mounted at `/vault/secrets`)             |  |
-|  | - File: `application-vault.properties`                                       |  |
-|  +-------------------+----------------------------------+-----------------------+  |
-|                      ^                                  |                          |
-|      Maintains &     |                                  | Reads on boot            |
-|      Renews Leases   |                                  v                          |
-|  +-------------------+--------------+      +------------+-----------------------+  |
-|  | Sidecar: `vault-agent`           |      | Container: `spring-boot-app`       |  |
-|  | - Auth: ServiceAccount Token     |      | - JVM executes                     |  |
-|  | - Consul Template Engine         |      | - `SPRING_CONFIG_ADDITIONAL_`      |  |
-|  | - Token Lifecycle Renewal        |      |   `LOCATION=file:/vault/secrets/..`|  |
-|  +-------------------+--------------+      +------------------------------------+  |
-+----------------------|-------------------------------------------------------------+
-                       |
-                       | 1. POST /v1/auth/kubernetes/login (JWT SA Token)
-                       | 2. GET  /v1/secret/data/my-app/config
-                       v
-        +------------------------------+
-        |    HashiCorp Vault Server    |
-        +------------------------------+
++------------------------------------------------------------------------------------+
 ```
 
-### 2.2 OpenShift RBAC Setup
-
-```yaml
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: spring-boot-sa
-  namespace: my-app-namespace
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: spring-boot-vault-auth-binding
-  namespace: my-app-namespace
-subjects:
-  - kind: ServiceAccount
-    name: spring-boot-sa
-    namespace: my-app-namespace
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:auth-delegator
-```
 
-### 2.3 OpenShift Deployment Manifest
+### 2.4 Complete OpenShift Deployment Manifest (Sidecar + Secrets + TLS + Hot-Reload)
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: spring-boot-sidecar-app
+  name: spring-boot-vault-sidecar
   namespace: my-app-namespace
   labels:
     app.kubernetes.io/name: spring-boot-app
@@ -117,26 +158,43 @@ spec:
       labels:
         app: spring-boot-app
       annotations:
-        # 1. Enable Sidecar Injection
+        # 1. Enable Vault Agent Injection
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "spring-boot-role"
-        vault.hashicorp.com/agent-pre-populate-only: "false"
-        
-        # 2. Configure Vault Server Endpoint & Auth Path
         vault.hashicorp.com/agent-inject-status: "update"
         vault.hashicorp.com/auth-path: "auth/kubernetes"
         
-        # 3. Define Secret Path and Target File
+        # 2. Render Application Properties & Trigger Actuator Refresh
         vault.hashicorp.com/agent-inject-secret-application-vault.properties: "secret/data/my-app/config"
-        
-        # 4. Consul Template definition
         vault.hashicorp.com/agent-inject-template-application-vault.properties: |
           {{- with secret "secret/data/my-app/config" -}}
-          spring.datasource.url=jdbc:postgresql://{{ .Data.data.db_host }}:5432/{{ .Data.data.db_name }}
-          spring.datasource.username={{ .Data.data.db_username }}
-          spring.datasource.password={{ .Data.data.db_password }}
-          app.security.jwt-secret={{ .Data.data.jwt_secret }}
           app.payment.api-key={{ .Data.data.api_key }}
+          app.features.enable-discounts={{ .Data.data.enable_discounts }}
+          spring.datasource.username={{ .Data.data.db_user }}
+          spring.datasource.password={{ .Data.data.db_pass }}
+          {{- end -}}
+        vault.hashicorp.com/agent-inject-command-application-vault.properties: |
+          curl -s -X POST http://localhost:8080/actuator/refresh || true
+
+        # 3. Render TLS Server Certificate (PKI Engine)
+        vault.hashicorp.com/agent-inject-secret-tls.crt: "pki/issue/spring-boot-role"
+        vault.hashicorp.com/agent-inject-template-tls.crt: |
+          {{- with secret "pki/issue/spring-boot-role" "common_name=my-app.my-app-namespace.svc" "ttl=24h" -}}
+          {{ .Data.certificate }}
+          {{- end -}}
+
+        # 4. Render TLS Private Key
+        vault.hashicorp.com/agent-inject-secret-tls.key: "pki/issue/spring-boot-role"
+        vault.hashicorp.com/agent-inject-template-tls.key: |
+          {{- with secret "pki/issue/spring-boot-role" "common_name=my-app.my-app-namespace.svc" "ttl=24h" -}}
+          {{ .Data.private_key }}
+          {{- end -}}
+
+        # 5. Render CA Certificate Chain
+        vault.hashicorp.com/agent-inject-secret-ca.crt: "pki/issue/spring-boot-role"
+        vault.hashicorp.com/agent-inject-template-ca.crt: |
+          {{- with secret "pki/issue/spring-boot-role" "common_name=my-app.my-app-namespace.svc" "ttl=24h" -}}
+          {{ .Data.issuing_ca }}
           {{- end -}}
     spec:
       serviceAccountName: spring-boot-sa
@@ -147,7 +205,8 @@ spec:
             - name: SPRING_CONFIG_ADDITIONAL_LOCATION
               value: "file:/vault/secrets/application-vault.properties"
           ports:
-            - containerPort: 8080
+            - containerPort: 8443
+              name: https
           resources:
             requests:
               cpu: "250m"
@@ -157,9 +216,83 @@ spec:
               memory: "1Gi"
 ```
 
-### 2.4 Spring Boot Application Configuration
-- No dependencies are added to `pom.xml`.
-- Standard Spring Boot property bindings (e.g. `@Value("${app.payment.api-key}")` or `@ConfigurationProperties`) consume the properties automatically.
+---
+
+### 2.5 Spring Boot Application Setup (Java Code & `application.yml`)
+
+#### `pom.xml` Dependencies:
+```xml
+<dependencies>
+    <!-- Web & Actuator -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <!-- Spring Cloud Context for @RefreshScope -->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-bootstrap</artifactId>
+        <version>4.1.2</version>
+    </dependency>
+</dependencies>
+```
+
+#### `src/main/resources/application.yml`:
+```yaml
+server:
+  port: 8443
+  ssl:
+    bundle: "vault-ssl-bundle"
+
+spring:
+  ssl:
+    bundle:
+      pem:
+        vault-ssl-bundle:
+          reload-on-update: true    # Automatically hot-reloads SSL context when sidecar updates cert!
+          keystore:
+            certificate: "file:/vault/secrets/tls.crt"
+            private-key: "file:/vault/secrets/tls.key"
+          truststore:
+            certificate: "file:/vault/secrets/ca.crt"
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "health,info,refresh"
+```
+
+#### `@RefreshScope` Controller (`PaymentController.java`):
+```java
+package com.example.app;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.context.config.annotation.RefreshScope;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RefreshScope  // <-- Reloads in-memory when sidecar calls /actuator/refresh
+public class PaymentController {
+
+    @Value("${app.payment.api-key:default-key}")
+    private String apiKey;
+
+    @Value("${app.features.enable-discounts:false}")
+    private boolean discountsEnabled;
+
+    @GetMapping("/api/v1/payment/config")
+    public ResponseEntity<String> getConfig() {
+        return ResponseEntity.ok("Active Key: " + apiKey + ", Discounts: " + discountsEnabled);
+    }
+}
+```
 
 ---
 
@@ -271,19 +404,6 @@ spec:
             - containerPort: 8080
 ```
 
-### 3.4 Spring Boot `application.yml`
-```yaml
-spring:
-  datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:5432/${DB_NAME:appdb}
-    username: ${DB_USERNAME}
-    password: ${DB_PASSWORD}
-
-app:
-  payment:
-    api-key: ${API_KEY}
-```
-
 ---
 
 ## 4. Option 3: Direct Spring Boot Integration (Spring Cloud Vault)
@@ -295,7 +415,7 @@ The Spring Boot application communicates directly with the Vault REST API using 
 ```text
 +---------------------------------------------------------------------------------------+
 | OpenShift Pod                                                                         |
-|                                                                               |
+|                                                                                       |
 |  +---------------------------------------------------------------------------------+  |
 |  | Spring Boot JVM Process                                                         |  |
 |  |                                                                                 |  |
@@ -375,7 +495,7 @@ spring:
         role: spring-boot-role
         kubernetes-path: kubernetes
         service-account-token-file: /var/run/secrets/kubernetes.io/serviceaccount/token
-      # Dynamic Database Secrets Configuration (Optional)
+      # Dynamic Database Secrets Configuration
       database:
         enabled: true
         role: app-db-role
@@ -388,38 +508,9 @@ management:
         include: "health,info,refresh"
 ```
 
-### 4.4 OpenShift Deployment Manifest
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: spring-boot-direct-vault
-  namespace: my-app-namespace
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: spring-boot-app
-  template:
-    metadata:
-      labels:
-        app: spring-boot-app
-    spec:
-      serviceAccountName: spring-boot-sa
-      containers:
-        - name: spring-boot-app
-          image: image-registry.openshift-image-stream.local/my-app-namespace/spring-boot-app:latest
-          ports:
-            - containerPort: 8080
-          env:
-            - name: SPRING_PROFILES_ACTIVE
-              value: "openshift"
-```
-
 ---
 
-## 5. Security & Operational Decision Matrix
+## 5. Security & Operational Decision Guide
 
 ```
                              +-------------------------------+
@@ -441,11 +532,12 @@ spec:
 
 1. **Choose Option 1 (Vault Agent Sidecar)** when:
    - Migrating existing applications with zero code refactoring.
-   - Applications must never persist credentials to OpenShift `etcd`.
-   - You need sidecar templating to produce custom configuration file formats (e.g., XML, YAML, JKS truststores).
+   - Applications require short-lived TLS X.509 certificates rendered to disk.
+   - You want hot-reloading of properties via Actuator and hot-reloading of TLS via Spring 3.2+ `SslBundle`.
+   - Credentials must never be stored in OpenShift `etcd`.
 
 2. **Choose Option 2 (Static Secret Sync - VSO/ESO)** when:
-   - Operating in standard GitOps environments where infrastructure teams manage Secrets as native Kubernetes objects.
+   - Operating in standard GitOps environments (e.g., ArgoCD) where platform engineers manage Secrets as native OpenShift objects.
    - Running lightweight microservices where extra sidecar memory overhead is prohibited.
 
 3. **Choose Option 3 (Direct Spring Cloud Vault)** when:
