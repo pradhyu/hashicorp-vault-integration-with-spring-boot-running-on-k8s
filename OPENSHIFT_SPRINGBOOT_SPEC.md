@@ -73,6 +73,34 @@ Pod Lifecycle Timeline
 
 ---
 
+#### 💡 FYI: Running ONLY the Init Container (No Sidecar at Runtime)
+
+If you do **not** want a background sidecar container running inside your Pod (to save CPU/memory resources), you can configure Vault Agent to run **exclusively as an `initContainer`** by adding:
+
+```yaml
+metadata:
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    # Enable Init-Container-ONLY mode (No sidecar injected):
+    vault.hashicorp.com/agent-pre-populate-only: "true"
+```
+
+##### How `agent-pre-populate-only: "true"` Works:
+1. OpenShift injects **only** `vault-agent-init`.
+2. `vault-agent-init` authenticates, fetches secrets/TLS certificates, writes them to `/vault/secrets/`, and **exits with code 0**.
+3. **No `vault-agent` sidecar is injected.** The Pod runs **only** your `spring-boot-app` container at runtime.
+
+##### Trade-Offs Matrix: Init-Only vs. Sidecar Mode:
+
+| Feature / Behavior | Init-Container-Only (`pre-populate-only: true`) | Standard Sidecar Mode (`pre-populate-only: false`) |
+| :--- | :--- | :--- |
+| **Runtime Resource Overhead** | **Zero** (Init container terminates before app starts) | Small (Sidecar consumes ~20-50MB RAM / 10m CPU) |
+| **Secret Rotation Handling** | Requires **Rolling Pod Restart** to fetch new secrets | Can hot-reload in-memory via Actuator without restart |
+| **Dynamic DB Lease Renewal** | ❌ Not supported (Lease expires without renewal) | Supported (Sidecar continuously renews DB leases) |
+| **Best Used For** | **Static KV secrets** where pod restarts are acceptable | Dynamic databases, short-lived TLS, or live hot-reloading |
+
+---
+
 ### 2.2 Authentication Mechanics: The 3-Way Kubernetes Auth Handshake
 
 Neither the application nor the sidecar uses static passwords or pre-shared tokens to authenticate with Vault. Instead, authentication uses **OpenShift ServiceAccount Identity (`auth/kubernetes`)** via a 3-way cryptographic validation handshake:
@@ -155,6 +183,212 @@ subjects:
     name: vault-auth-sa
     namespace: vault-system
 ```
+
+---
+
+#### 3. How to Configure ServiceAccount Role Bindings via the Vault Web UI
+
+You can set up the entire ServiceAccount binding without using the command line by following these steps in the **Vault Web UI**:
+
+```text
++-------------------------------------------------------------------------------------------------+
+|                                 VAULT WEB UI CONFIGURATION STEPS                                |
++-------------------------------------------------------------------------------------------------+
+| 1. Create ACL Policy:                                                                           |
+|    Navigate to: Access -> Policies -> Create ACL Policy                                         |
+|    - Name: "spring-boot-policy"                                                                 |
+|    - Rule: path "secret/data/my-app/*" { capabilities = ["read"] }                              |
+|                                                                                                 |
+| 2. Configure Kubernetes Role:                                                                   |
+|    Navigate to: Access -> Auth Methods -> Click "kubernetes" -> Click "Create role" (or Edit)  |
+|    - Role Name: "spring-boot-role"                                                              |
+|    - Bound Service Account Names: "spring-boot-sa, order-service-sa"                            |
+|    - Bound Service Account Namespaces: "my-app-namespace"                                       |
+|    - Generated Token's Policies: Select "spring-boot-policy"                                    |
+|    - Token TTL: "3600" (1h)                                                                     |
+|    - Click "Save"                                                                               |
++-------------------------------------------------------------------------------------------------+
+```
+
+##### Step 1: Create or Update the ACL Policy in the UI
+1. Open the Vault Web UI in your browser (`https://vault-ui.apps.my-cluster.com`).
+2. In the top navigation, click **Access** $\rightarrow$ **Policies**.
+3. Click **Create ACL policy**.
+4. Set **Name**: `spring-boot-policy`.
+5. In the **Policy** editor box, paste your least-privilege rules:
+   ```hcl
+   path "secret/data/my-app/*" {
+     capabilities = ["read"]
+   }
+   path "pki/issue/spring-boot-role" {
+     capabilities = ["update"]
+   }
+   ```
+6. Click **Create policy**.
+
+##### Step 2: Bind the ServiceAccount & Namespace in the Kubernetes Auth Engine
+1. Click **Access** $\rightarrow$ **Auth Methods**.
+2. Click on the **kubernetes** auth method (or enable it if not already enabled).
+3. Under the **Roles** tab, click **Create role** (or select an existing role and click **Edit role**).
+4. Fill in the form fields:
+   * **Role name**: `spring-boot-role`
+   * **Bound service account names**: Type `spring-boot-sa` (add any additional SAs like `order-service-sa` separated by comma).
+   * **Bound service account namespaces**: Type `my-app-namespace`.
+   * **Generated token's policies**: Select or type `spring-boot-policy`.
+   * **Token TTL**: `1h` (or `3600`).
+   * **Token max TTL**: `24h` (or `86400`).
+5. Click **Save**.
+
+---
+
+#### 4. How to Configure the Same Role via Vault CLI & REST API
+
+**Via Vault CLI:**
+```bash
+vault write auth/kubernetes/role/spring-boot-role \
+    bound_service_account_names="spring-boot-sa,order-service-sa" \
+    bound_service_account_namespaces="my-app-namespace" \
+    policies="spring-boot-policy" \
+    ttl=1h
+```
+
+**Via Vault REST API (`curl`):**
+```bash
+curl --silent --location --request POST "https://vault.vault-system.svc.cluster.local:8200/v1/auth/kubernetes/role/spring-boot-role" \
+  --header "X-Vault-Token: ${VAULT_TOKEN}" \
+  --header "Content-Type: application/json" \
+  --data '{
+    "bound_service_account_names": ["spring-boot-sa", "order-service-sa"],
+    "bound_service_account_namespaces": ["my-app-namespace"],
+    "policies": ["spring-boot-policy"],
+    "ttl": "3600"
+  }'
+```
+
+---
+
+#### 5. Automated Multi-Tenant Setup: Wildcard Roles & Dynamic Namespace Templating
+
+If you want **any namespace** and its **`default` ServiceAccount** to automatically authenticate without manually creating a new role for each namespace, use **Wildcard Namespace Roles** combined with **Dynamic Policy Path Templating**:
+
+```text
++---------------------------------------------------------------------------------------------------------+
+| AUTOMATED MULTI-NAMESPACE ISOLATION (ZERO PER-NAMESPACE CONFIGURATION)                                  |
++---------------------------------------------------------------------------------------------------------+
+| 1. GLOBAL WILDCARD ROLE IN VAULT:                                                                       |
+|    - bound_service_account_names      = ["default"]  (or ["*"])                                         |
+|    - bound_service_account_namespaces = ["*"]                                                           |
+|    - policy                           = "dynamic-namespace-policy"                                      |
+|                                                                                                         |
+| 2. DYNAMIC TEMPLATED ACL POLICY:                                                                        |
+|    path "secret/data/{{identity.entity.aliases.<accessor>.metadata.service_account_namespace}}/*" {     |
+|      capabilities = ["read"]                                                                            |
+|    }                                                                                                    |
++---------------------------------------------------------------------------------------------------------+
+                                                     |
+            +----------------------------------------+----------------------------------------+
+            |                                                                                 |
+            v                                                                                 v
+[ Pod in Namespace: `billing` ]                                                   [ Pod in Namespace: `orders` ]
+SA: `default`                                                                     SA: `default`
+-> Vault extracts metadata: `service_account_namespace=billing`                   -> Vault extracts metadata: `service_account_namespace=orders`
+-> Automatically granted access ONLY to:                                          -> Automatically granted access ONLY to:
+   `secret/data/billing/*`                                                           `secret/data/orders/*`
+   (BLOCKED from `orders`!)                                                          (BLOCKED from `billing`!)
+```
+
+##### Step 1: Write the "Convention over Configuration" Master Policy
+Vault automatically populates metadata about the authenticated pod (including its OpenShift namespace). By following standard naming conventions, a **single policy** grants access to KV secrets, Dynamic Databases, PKI TLS certs, and Transit Encryption matching that exact namespace:
+
+```bash
+# Get the Kubernetes auth accessor ID (e.g. auth_kubernetes_a1b2c3d4)
+ACCESSOR=$(vault auth list -format=json | jq -r '."kubernetes/".accessor')
+
+# Create the Convention-over-Configuration Master Policy:
+vault policy write dynamic-namespace-policy - <<EOF
+# 1. KV v2 Secrets (Convention: secret/data/<namespace>/*)
+path "secret/data/{{identity.entity.aliases.${ACCESSOR}.metadata.service_account_namespace}}/*" {
+  capabilities = ["read", "list"]
+}
+path "secret/metadata/{{identity.entity.aliases.${ACCESSOR}.metadata.service_account_namespace}}/*" {
+  capabilities = ["list", "read"]
+}
+
+# 2. Dynamic Database Credentials (Convention: database/creds/<namespace>-db-role)
+path "database/creds/{{identity.entity.aliases.${ACCESSOR}.metadata.service_account_namespace}}-db-role" {
+  capabilities = ["read"]
+}
+
+# 3. Dynamic PKI / TLS Certificates (Convention: pki/issue/<namespace>-role)
+path "pki/issue/{{identity.entity.aliases.${ACCESSOR}.metadata.service_account_namespace}}-role" {
+  capabilities = ["update"]
+}
+
+# 4. Transit Encryption-as-a-Service (Convention: transit/encrypt/<namespace>-key)
+path "transit/encrypt/{{identity.entity.aliases.${ACCESSOR}.metadata.service_account_namespace}}-key" {
+  capabilities = ["update"]
+}
+path "transit/decrypt/{{identity.entity.aliases.${ACCESSOR}.metadata.service_account_namespace}}-key" {
+  capabilities = ["update"]
+}
+EOF
+```
+
+#### Convention-over-Configuration Mapping Table:
+
+| Resource Type | Standard Vault Path Convention | Automatically Accessible by SA `default` in namespace `<ns>` |
+| :--- | :--- | :--- |
+| **KV v2 Config** | `secret/data/<namespace>/config` | `secret/data/<ns>/*` (Read/List) |
+| **Dynamic DB** | `database/creds/<namespace>-db-role` | Auto-generates ephemeral DB user for `<ns>` |
+| **TLS Certs** | `pki/issue/<namespace>-role` | Issues 24h mTLS X.509 cert for `<ns>` |
+| **Transit EaaS** | `transit/encrypt/<namespace>-key` | Field-level PII encryption for `<ns>` |
+
+##### Step 2: Create the Global Wildcard Role
+Configure the Kubernetes role to accept `default` (or `*`) from all namespaces:
+
+```bash
+# Via Vault CLI:
+vault write auth/kubernetes/role/default-namespace-role \
+    bound_service_account_names="default" \
+    bound_service_account_namespaces="*" \
+    policies="dynamic-namespace-policy" \
+    ttl=1h
+```
+
+**In Vault Web UI:**
+1. Navigate to **Access** $\rightarrow$ **Auth Methods** $\rightarrow$ **kubernetes** $\rightarrow$ **Create role**.
+2. Set **Role name**: `default-namespace-role`.
+3. Set **Bound service account names**: `default`.
+4. Set **Bound service account namespaces**: `*` (wildcard).
+5. Set **Generated token's policies**: `dynamic-namespace-policy`.
+6. Click **Save**.
+
+##### Step 3: Use in Any OpenShift Namespace
+In any application Pod in any namespace (e.g. `billing`, `inventory`, `payments`), simply annotate:
+```yaml
+annotations:
+  vault.hashicorp.com/agent-inject: "true"
+  vault.hashicorp.com/role: "default-namespace-role"
+  vault.hashicorp.com/agent-inject-secret-application-vault.properties: "secret/data/billing/config"
+```
+
+---
+
+##### 4. Security Guarantee: Why Cross-Namespace Access is IMPOSSIBLE
+
+Even though every namespace uses the same role name (`default-namespace-role`) and the same ServiceAccount name (`default`), **cross-namespace access is strictly blocked**:
+
+| Requesting Pod Identity | Requested Vault Secret Path | Vault Policy Evaluation | Result |
+| :--- | :--- | :--- | :--- |
+| Namespace: `billing` \| SA: `default` | `secret/data/billing/config` | Allowed: Matches `secret/data/billing/*` | **200 OK (Allowed)** |
+| Namespace: `billing` \| SA: `default` | `secret/data/orders/config` | Denied: `billing` != `orders` | ❌ **403 Forbidden (Blocked)** |
+| Namespace: `orders` \| SA: `default` | `secret/data/orders/config` | Allowed: Matches `secret/data/orders/*` | **200 OK (Allowed)** |
+| Namespace: `orders` \| SA: `default` | `secret/data/billing/config` | Denied: `orders` != `billing` | ❌ **403 Forbidden (Blocked)** |
+
+#### How Vault Enforces This Cryptographically:
+1. **OpenShift Signs the JWT**: The JWT mounted in the Pod contains a tamper-proof claim signed by OpenShift: `"kubernetes.io/serviceaccount/namespace": "billing"`.
+2. **Vault Extracts the Claim**: During the 3-way handshake with OpenShift's `TokenReview` API, Vault securely extracts the namespace claim into the token entity metadata.
+3. **Dynamic Path Enforcement**: Vault evaluates `path "secret/data/{{namespace}}/*"`. Because the namespace in the metadata is `billing`, Vault restricts the token's capability strictly to `secret/data/billing/*`. A pod in `billing` cannot modify its own metadata to impersonate `orders`.
 
 ---
 
@@ -374,6 +608,71 @@ management:
       exposure:
         include: "health,info,refresh"
 ```
+
+#### Spring Boot Property Override Parameters: `spring.config.import` vs. `spring.config.additional-location`
+
+To understand the difference, look at **HOW** Spring Boot finds and loads configuration files during startup:
+
+```text
+========================================================================================================
+1. TRADITIONAL SEARCH PATH (spring.config.additional-location): "SEARCH IN EXTRA DIRECTORIES"
+========================================================================================================
+Spring Boot by default looks for application.properties/yml in fixed directories:
+  [classpath:/, classpath:/config/, file:./, file:./config/]
+
+When you set:
+  SPRING_CONFIG_ADDITIONAL_LOCATION=file:/vault/secrets/
+
+Spring Boot treats /vault/secrets/ as an ADDITIONAL FOLDER to search for:
+  - It expects to find standard files named `application.properties` or `application-{profile}.properties` inside that folder.
+  - It searches this folder BEFORE or AFTER the standard locations based on internal precedence.
+  - It is an all-or-nothing folder lookup from the Boot 1.x/2.x era.
+
+========================================================================================================
+2. MODERN ConfigData API (spring.config.import): "DIRECTLY INCLUDE THIS SPECIFIC RESOURCE"
+========================================================================================================
+When you set:
+  spring.config.import=optional:file:/vault/secrets/application-vault.properties
+
+Spring Boot does NOT just search a folder. It directly imports that EXACT resource as part of the config stream:
+  - You can point to ANY arbitrary filename (e.g., `application-vault.properties`, `db-creds.ini`, etc.).
+  - It allows the `optional:` flag so startup never fails if the file is missing (crucial for local dev and CI tests).
+  - It allows protocol prefixes: `file:`, `classpath:`, `configtree:`, `vault://`, `consul://`, `aws-secretsmanager:`.
+  - Properties loaded via `spring.config.import` immediately override the document that imported them.
+```
+
+#### Key Differences Breakdown:
+
+| Dimension | `spring.config.additional-location` | `spring.config.import` |
+| :--- | :--- | :--- |
+| **Mental Model** | *"Add this folder to the list of places you look for `application.properties`"* | *"Explicitly read this specific file/resource right now and merge its key-values"* |
+| **Target Naming** | Usually expects a directory path containing standard named files (`application.properties`). | Can import exact, arbitrarily named files (`application-vault.properties`, `custom.yaml`). |
+| **Missing File Behavior** | If the location does not exist, Spring Boot **aborts startup** with a fatal error. | With `optional:`, Spring Boot **silently ignores** missing files (safe for local development). |
+| **Supported Protocols** | Only local/container filesystem paths (`file:...`, `classpath:...`). | Anything supported by ConfigData loaders (`file:`, `configtree:`, `vault://`, `consul://`). |
+| **Where Declared** | Must be set from the outside (Environment Variable `SPRING_CONFIG_ADDITIONAL_LOCATION` or JVM `-D` arg). | Can be declared cleanly inside `src/main/resources/application.yml` OR via environment variable (`SPRING_CONFIG_IMPORT`). |
+
+#### Concrete Example:
+
+1. **Using `spring.config.import` (Recommended):**
+   ```yaml
+   # src/main/resources/application.yml
+   spring:
+     config:
+       import:
+         # Safely ignored on developer laptop / CI pipeline, loaded in OpenShift container:
+         - "optional:file:/vault/secrets/application-vault.properties"
+   ```
+
+2. **Using `SPRING_CONFIG_ADDITIONAL_LOCATION` (Legacy approach):**
+   ```yaml
+   # OpenShift Deployment env:
+   env:
+     - name: SPRING_CONFIG_ADDITIONAL_LOCATION
+       value: "file:/vault/secrets/"
+   # (Vault Agent template must write a file named strictly "application.properties")
+   ```
+
+---
 
 #### `@RefreshScope` Controller (`PaymentController.java`):
 ```java
